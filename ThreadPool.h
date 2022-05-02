@@ -110,24 +110,57 @@ public:
     }
 
     /**
-     * @brief Wait for tasks to be completed. Normally, this function waits for all tasks, both those that are currently running in the threads and those that are still waiting in the queue. 
-     * - However, if the variable paused is set to true, this function only waits for the currently running tasks (otherwise it would wait forever). 
-     * - To wait for a specific task, use submit() instead, and call the wait() member function of the generated future.
+     * @brief Parallelize a loop by splitting it into blocks, submitting each block separately to the thread pool, and waiting for all blocks to finish executing.
+     * - The user supplies a loop function, which will be called once per block and should iterate over the block's range.
+     *
+     * @tparam T1 The type of the first index in the loop. Should be a signed or unsigned integer.
+     * @tparam T2 The type of the index after the last index in the loop. Should be a signed or unsigned integer. If T1 is not the same as T2, a common type will be automatically inferred.
+     * @tparam F The type of the function to loop through.
+     * @param first_index The first index in the loop.
+     * @param index_after_last The index after the last index in the loop. The loop will iterate from first_index to (index_after_last - 1) inclusive.
+     * - In other words, it will be equivalent to "for (T i = first_index; i < index_after_last; i++)". Note that if first_index == index_after_last, the function will terminate without doing anything.
+     * @param loop The function to loop through. Will be called once per block. Should take exactly two arguments: the first index in the block and the index after the last index in the block.
+     * - loop(start, end) should typically involve a loop of the form "for (T i = start; i < end; i++)".
+     * @param num_blocks The maximum number of blocks to split the loop into. The default is to use the number of threads in the pool.
      */
-    void waitForTasks()
+    template <typename T1, typename T2, typename F>
+    void parallelizeLoop(const T1& first_index, const T2& index_after_last, const F& loop, ui32 num_blocks = 0)
     {
-        while (true)
+        typedef std::common_type_t<T1, T2> T;
+        auto the_first_index = static_cast<T>(first_index);
+        auto last_index = static_cast<T>(index_after_last);
+
+        if (the_first_index == last_index)
+            return;
+
+        if (last_index < the_first_index)
+            std::swap(last_index, the_first_index);
+
+        last_index--;
+        if (num_blocks == 0)
+            num_blocks = m_ThreadCount;
+
+        auto total_size = static_cast<ui64>(last_index - the_first_index + 1);
+        auto block_size = static_cast<ui64>(total_size / num_blocks);
+        if (block_size == 0)
         {
-            if (!m_bPaused)
+            block_size = 1;
+            num_blocks = static_cast<ui32>(total_size) > 1 ? static_cast<ui32>(total_size) : 1;
+        }
+        std::atomic<ui32> blocks_running = 0;
+        for (ui32 t = 0; t < num_blocks; t++)
+        {
+            auto start = (static_cast<T>(t * block_size) + the_first_index);
+            auto end = (t == num_blocks - 1) ? last_index + 1 : (static_cast<T>((t + 1) * block_size) + the_first_index);
+            blocks_running++;
+            push_task([start, end, &loop, &blocks_running]
             {
-                if (m_tasksTotal == 0)
-                    break;
-            }
-            else
-            {
-                if (getTasksRunning() == 0)
-                    break;
-            }
+                loop(start, end);
+                blocks_running--;
+            });
+        }
+        while (blocks_running != 0)
+        {
             sleepOrYield();
         }
     }
@@ -141,14 +174,16 @@ public:
     template<typename T>
     void pushTask(const T& task)
     {
-        ++m_tasksTotal;
-        const std::scoped_lock<std::mutex>(m_queueMtx);
-        m_tasks.push(std::function<void>(task));
+        m_tasksTotal++;
+        {
+            const std::scoped_lock lock(m_queueMtx);
+            m_tasks.push(std::function<void()>(task));
+        }
     }
 
     /**
      * @brief Push a function with arguments, but no return value, into the task queue.
-     * @details The function is wrapped inside a lambda in order to hide the arguments, as the tasks in the queue must be of type std::function<void()>, so they cannot have any arguments or return value. 
+     * @details The function is wrapped inside a lambda in order to hide the arguments, as the tasks in the queue must be of type std::function<void()>, so they cannot have any arguments or return value.
      * - If no arguments are provided, the other overload will be used, in order to avoid the (slight) overhead of using a lambda.
      *
      * @tparam T The type of the function.
@@ -164,6 +199,27 @@ public:
             {
                 task(args...);
             });
+    }
+
+    /**
+     * @brief Reset the number of threads in the pool. Waits for all currently running tasks to be completed, then destroys all threads in the pool and creates a new thread pool with the new number of threads.
+     * - Any tasks that were waiting in the queue before the pool was reset will then be executed by the new threads. If the pool was paused before resetting it, the new pool will be paused as well.
+     *
+     * @param _thread_count The number of threads to use. The default value is the total number of hardware threads available, as reported by the implementation.
+     * - With a hyperthreaded CPU, this will be twice the number of CPU cores. If the argument is zero, the default value will be used instead.
+     */
+    void reset(const ui32& newThreadCnt = std::thread::hardware_concurrency())
+    {
+        auto bLastPauseStatus = m_bPaused.load();
+        m_bPaused = true;
+        waitForTasks();
+        m_bRunning = false;
+        destroyThreads();
+        m_ThreadCount = newThreadCnt;
+        m_pThreads.reset(new std::thread[m_ThreadCount]);
+        createThreads();
+        m_bRunning = true;
+        m_bPaused = bLastPauseStatus;
     }
 
     /**
@@ -239,81 +295,39 @@ public:
     }
 
     /**
-     * @brief Reset the number of threads in the pool. Waits for all currently running tasks to be completed, then destroys all threads in the pool and creates a new thread pool with the new number of threads. 
-     * - Any tasks that were waiting in the queue before the pool was reset will then be executed by the new threads. If the pool was paused before resetting it, the new pool will be paused as well.
-     *
-     * @param _thread_count The number of threads to use. The default value is the total number of hardware threads available, as reported by the implementation. 
-     * - With a hyperthreaded CPU, this will be twice the number of CPU cores. If the argument is zero, the default value will be used instead.
+     * @brief Wait for tasks to be completed. Normally, this function waits for all tasks, both those that are currently running in the threads and those that are still waiting in the queue.
+     * - However, if the variable paused is set to true, this function only waits for the currently running tasks (otherwise it would wait forever).
+     * - To wait for a specific task, use submit() instead, and call the wait() member function of the generated future.
      */
-    void reset(const ui32& newThreadCnt = std::thread::hardware_concurrency())
+    void waitForTasks()
     {
-        auto bLastPauseStatus = m_bPaused.load();
-        m_bPaused = true;
-        waitForTasks();
-        m_bRunning = false;
-        destroyThreads();
-        m_ThreadCount = newThreadCnt;
-        m_pThreads.reset(new std::thread[m_ThreadCount]);
-        createThreads();
-        m_bRunning = true;
-        m_bPaused = bLastPauseStatus;
-    }
-
-    /**
-     * @brief Parallelize a loop by splitting it into blocks, submitting each block separately to the thread pool, and waiting for all blocks to finish executing.
-     * - The user supplies a loop function, which will be called once per block and should iterate over the block's range.
-     *
-     * @tparam T1 The type of the first index in the loop. Should be a signed or unsigned integer.
-     * @tparam T2 The type of the index after the last index in the loop. Should be a signed or unsigned integer. If T1 is not the same as T2, a common type will be automatically inferred.
-     * @tparam F The type of the function to loop through.
-     * @param first_index The first index in the loop.
-     * @param index_after_last The index after the last index in the loop. The loop will iterate from first_index to (index_after_last - 1) inclusive. 
-     * - In other words, it will be equivalent to "for (T i = first_index; i < index_after_last; i++)". Note that if first_index == index_after_last, the function will terminate without doing anything.
-     * @param loop The function to loop through. Will be called once per block. Should take exactly two arguments: the first index in the block and the index after the last index in the block.
-     * - loop(start, end) should typically involve a loop of the form "for (T i = start; i < end; i++)".
-     * @param num_blocks The maximum number of blocks to split the loop into. The default is to use the number of threads in the pool.
-     */
-    template <typename T1, typename T2, typename F>
-    void parallelizeLoop(const T1& first_index, const T2& index_after_last, const F& loop, ui32 num_blocks = 0)
-    {
-        typedef std::common_type_t<T1, T2> T;
-        auto the_first_index = static_cast<T>(first_index);
-        auto last_index = static_cast<T>(index_after_last);
-        
-        if (the_first_index == last_index)
-            return;
-
-        if (last_index < the_first_index)
-            std::swap(last_index, the_first_index);
-
-        last_index--;
-        if (num_blocks == 0)
-            num_blocks = m_ThreadCount;
-
-        auto total_size = static_cast<ui64>(last_index - the_first_index + 1);
-        auto block_size = static_cast<ui64>(total_size / num_blocks);
-        if (block_size == 0)
+        while (true)
         {
-            block_size = 1;
-            num_blocks = static_cast<ui32>(total_size) > 1 ? static_cast<ui32>(total_size) : 1;
-        }
-        std::atomic<ui32> blocks_running = 0;
-        for (ui32 t = 0; t < num_blocks; t++)
-        {
-            auto start = (static_cast<T>(t * block_size) + the_first_index);
-            auto end = (t == num_blocks - 1) ? last_index + 1 : (static_cast<T>((t + 1) * block_size) + the_first_index);
-            blocks_running++;
-            push_task([start, end, &loop, &blocks_running]
+            if (!m_bPaused.load())
             {
-                loop(start, end);
-                blocks_running--;
-            });
-        }
-        while (blocks_running != 0)
-        {
+                if (m_tasksTotal == 0)
+                    break;
+            }
+            else
+            {
+                if (getTasksRunning() == 0)
+                    break;
+            }
             sleepOrYield();
         }
     }
+
+    /**
+     * @brief An atomic variable indicating to the workers to pause. When set to true, the workers temporarily stop popping new tasks out of the queue,
+     * - although any tasks already executed will keep running until they are done. Set to false again to resume popping tasks.
+     */
+    std::atomic<bool> m_bPaused = false;
+
+    /**
+     * @brief The duration, in microseconds, that the worker function should sleep for when it cannot find any tasks in the queue.
+     * - If set to 0, then instead of sleeping, the worker function will execute std::this_thread::yield() if there are no tasks in the queue. The default value is 1000.
+     */
+    ui32 m_sleepDuration = 1000;
 
 private:
     /**
@@ -377,7 +391,7 @@ private:
             if (!m_bPaused && popTask(task))
             {
                 task();
-                --m_tasksTotal;
+                m_tasksTotal--;
             }
             else
             {
@@ -394,7 +408,7 @@ private:
     /**
      * @brief An atomic variable indicating to the workers to keep running. When set to false, the workers permanently stop working.
      */
-    std::atomic<bool> m_bRunning = false;
+    std::atomic<bool> m_bRunning = true;
 
     /**
      * @brief A queue of tasks to be executed by the threads.
@@ -415,18 +429,6 @@ private:
      * @brief An atomic variable to keep track of the total number of unfinished tasks - either still in the queue, or running in a thread.
      */
     ui32 m_tasksTotal = 0;
-
-    /**
-     * @brief An atomic variable indicating to the workers to pause. When set to true, the workers temporarily stop popping new tasks out of the queue,
-     * - although any tasks already executed will keep running until they are done. Set to false again to resume popping tasks.
-     */
-    std::atomic<bool> m_bPaused = false;
-
-    /**
-     * @brief The duration, in microseconds, that the worker function should sleep for when it cannot find any tasks in the queue. 
-     * - If set to 0, then instead of sleeping, the worker function will execute std::this_thread::yield() if there are no tasks in the queue. The default value is 1000.
-     */
-    ui32 m_sleepDuration = 1000;
 };
 
 //                                     End class thread_pool                                     //
